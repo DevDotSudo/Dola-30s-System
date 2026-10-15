@@ -120,7 +120,7 @@ function dispatchHeadlessWorkerTask(account, task, saveFolder, onTelemetryLog) {
       cleanup('Task timed out after 3 hours.');
     }, 3 * 60 * 60 * 1000);
 
-    function cleanup(errorMsg = null, result = null) {
+    function cleanup(errorMsg = null) {
       if (isFinished) return;
       isFinished = true;
       activeWorkerCleanups.delete(cleanup);
@@ -147,7 +147,7 @@ function dispatchHeadlessWorkerTask(account, task, saveFolder, onTelemetryLog) {
       if (errorMsg) {
         reject(new Error(errorMsg));
       } else {
-        resolve(result);
+        resolve();
       }
     }
 
@@ -158,55 +158,10 @@ function dispatchHeadlessWorkerTask(account, task, saveFolder, onTelemetryLog) {
       }
     }
 
-    let isResolvingVideo = false;
-
-    async function handleVideoResolved(event, data) {
-      if (isFinished || isResolvingVideo) return;
-      if (!data || String(data.taskId) !== targetTaskId) return;
-
-      isResolvingVideo = true;
-      try {
-        const videoUrl = typeof data.videoUrl === 'string' ? data.videoUrl.trim() : '';
-        let parsedUrl;
-        try {
-          parsedUrl = new URL(videoUrl);
-        } catch (_) {
-          throw new Error('Dola returned an invalid video URL.');
-        }
-        if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
-          throw new Error('Dola returned an unsupported video URL protocol.');
-        }
-
-        const taskLabel = String(task.promptIndex || task.id || Date.now())
-          .replace(/[^a-zA-Z0-9_-]/g, '_');
-        const filename = `dola_video_${taskLabel}_${Date.now()}.mp4`;
-        if (onTelemetryLog) {
-          onTelemetryLog('info', `⬇️ [DOWNLOAD] Dola finished rendering; downloading video for task #${taskLabel}...`);
-        }
-
-        const downloaded = await downloadStreamToFile(videoUrl, saveFolder, filename, onTelemetryLog);
-        if (!downloaded || !downloaded.filePath || !fs.existsSync(downloaded.filePath)) {
-          throw new Error('Video download did not produce an output file.');
-        }
-
-        const stats = fs.statSync(downloaded.filePath);
-        if (!stats.size) {
-          try { fs.unlinkSync(downloaded.filePath); } catch (_) {}
-          throw new Error('Downloaded video file is empty.');
-        }
-
-        if (onTelemetryLog) {
-          onTelemetryLog('success', `✅ [DOWNLOAD COMPLETE] Saved ${filename} (${downloaded.sizeMB} MB).`);
-        }
-        cleanup(null, {
-          success: true,
-          filename,
-          filePath: downloaded.filePath,
-          fileSizeMB: downloaded.sizeMB,
-          duration: Number(data.duration) || Number(task.duration) || 30
-        });
-      } catch (err) {
-        cleanup(`Video resolved but download failed: ${err.message}`);
+    function handleVideoResolved(event, data) {
+      if (isFinished) return;
+      if (data && String(data.taskId) === targetTaskId) {
+        cleanup();
       }
     }
 
