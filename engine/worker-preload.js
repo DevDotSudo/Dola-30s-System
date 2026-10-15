@@ -80,12 +80,14 @@ function workerLog(type, message) {
 
 function classifyDolaResponse(text) {
   if (!text || typeof text !== 'string') {
-    return { isError: false, isLimit: false, isGuestNotAllowed: false, isHighDemand: false, is15sFallback: false, isConfirmationRequest: false, isPolicyOrModeration: false, isGeneralFailure: false, isAcceptedNotice: false, reason: '' };
+    return { isError: false, isLimit: false, isGuestNotAllowed: false, isHighDemand: false, is15sFallback: false, isConfirmationRequest: false, isPolicyOrModeration: false, isGeneralFailure: false, isUnsupportedDuration: false, isAcceptedNotice: false, reason: '' };
   }
 
   // 1. Detect confirmation requests from Dola (e.g. "Confirm if you'd like me to proceed", "Reply 'Confirm'")
   const isConfirmationRequest = (
     /confirm\s+if\s+you['’]?d?\s+like\s+me\s+to\s+proceed/i.test(text) ||
+    /would\s+you\s+like\s+me\s+to\s+proceed/i.test(text) ||
+    /would\s+you\s+like\s+me\s+to\s+generate/i.test(text) ||
     /please\s+confirm\s+and\s+I\s+will\s+begin/i.test(text) ||
     /confirm\s+to\s+generate/i.test(text) ||
     /Reply\s*[“"'](?:Confirm|Yes|Start)[”"']/i.test(text) ||
@@ -98,14 +100,12 @@ function classifyDolaResponse(text) {
     /ready in/i.test(text) ||
     /I['’]ll (?:send it to you|let you know) when it['’]s done/i.test(text) ||
     /generate your \d+-second/i.test(text) ||
-    /currently supports durations from/i.test(text) ||
-    /15-second version/i.test(text) ||
-    /condensed to a 15-second/i.test(text) ||
     /Seedance/i.test(text) ||
     /Dreamina/i.test(text)
   );
 
-  const is15sFallback = false;
+  const isUnsupportedDuration = /(?:currently supports durations? from\s*4\s*to\s*15\s*seconds?|only supports?\s*(?:a\s*)?(?:maximum of\s*)?15\s*seconds?|nearest supported duration of\s*15\s*seconds?)/i.test(text);
+  const is15sFallback = isUnsupportedDuration;
 
   // If accepted, mentions like "You still have 0 video credits left today" are NOT an error for the current task!
   const isLimit = !isAcceptedNotice && (
@@ -138,15 +138,16 @@ function classifyDolaResponse(text) {
     /generation failed|failed to generate|something went wrong|unable to process|internal server error|server error/i.test(text)
   );
 
-  const isError = isLimit || isGuestNotAllowed || isHighDemand || isPolicyOrModeration || isGeneralFailure;
+  const isError = isUnsupportedDuration || isLimit || isGuestNotAllowed || isHighDemand || isPolicyOrModeration || isGeneralFailure;
   let reason = '';
-  if (isLimit) reason = 'DAILY_OR_PRO_LIMIT_REACHED';
+  if (isUnsupportedDuration) reason = 'DOLA_DURATION_UNSUPPORTED';
+  else if (isLimit) reason = 'DAILY_OR_PRO_LIMIT_REACHED';
   else if (isGuestNotAllowed) reason = 'GUEST_NOT_ALLOWED_LOGIN_REQUIRED';
   else if (isHighDemand) reason = 'GPU_HIGH_DEMAND';
   else if (isPolicyOrModeration) reason = 'CONTENT_POLICY_VIOLATION';
   else if (isGeneralFailure) reason = 'DOLA_GENERATION_FAILED';
 
-  return { isError, isLimit, isGuestNotAllowed, isHighDemand, is15sFallback, isConfirmationRequest, isPolicyOrModeration, isGeneralFailure, isAcceptedNotice, reason };
+  return { isError, isLimit, isGuestNotAllowed, isHighDemand, is15sFallback, isConfirmationRequest, isPolicyOrModeration, isGeneralFailure, isUnsupportedDuration, isAcceptedNotice, reason };
 }
 
 function classifyLimits(text) {
@@ -564,22 +565,35 @@ function processScrapedChatText(source, text) {
 
   // Detect Dola video generation acceptance notice
   const isVideoGenerationNotice = (
-    classified.isAcceptedNotice ||
-    clean.includes("Generated video:") ||
-    clean.includes("I’ll generate a") ||
-    clean.includes("I'll generate a") ||
-    clean.includes("The video will be generated") ||
-    clean.includes("Seedance") ||
-    clean.includes("Dreamina") ||
-    clean.includes("ready in") ||
-    clean.includes("I'll send it to you when it's done") ||
-    clean.includes("I’ll send it to you when it’s done")
+    !classified.isUnsupportedDuration &&
+    !classified.isConfirmationRequest &&
+    (
+      classified.isAcceptedNotice ||
+      clean.includes("Generated video:") ||
+      clean.includes("I’ll generate a") ||
+      clean.includes("I'll generate a") ||
+      clean.includes("The video will be generated") ||
+      clean.includes("ready in") ||
+      clean.includes("I'll send it to you when it's done") ||
+      clean.includes("I’ll send it to you when it’s done")
+    )
   );
 
   if (isVideoGenerationNotice && !isGlobalGenerationAccepted) {
     isGlobalGenerationAccepted = true;
     currentTaskStartTime = Date.now();
     workerLog('success', `🎬 [DOLA GENERATION CONFIRMED] ${clean}`);
+  }
+
+  // A duration-limit response is not a generation acceptance. Do not auto-confirm
+  // a shorter clip when the queued task explicitly requested 30 seconds.
+  if (classified.isUnsupportedDuration) {
+    workerLog('error', `❌ [DOLA DURATION UNSUPPORTED] Requested ${currentTask?.duration || 30}s, but Dola reports a 4–15s limit. No confirmation was sent; choose a supported duration or split the concept into multiple clips.`);
+    ipcRenderer.send('worker-error', {
+      taskId: currentTask?.taskId,
+      error: 'DOLA_DURATION_UNSUPPORTED: Dola currently reports a maximum supported duration of 15 seconds for this mode.'
+    });
+    return;
   }
 
   // Handle confirmation requests (e.g. "Confirm if you'd like me to proceed", "Reply 'Confirm'")
@@ -623,11 +637,10 @@ function processScrapedChatText(source, text) {
     return;
   }
 
-  // Clean reply with zero errors confirms generation started!
+  // Ordinary chat text is not proof that a video job started. Only a real
+  // creation ID/status from the intercepted generation response can confirm GPU work.
   if (!isGlobalGenerationAccepted && !classified.is15sFallback && !classified.isConfirmationRequest) {
-    isGlobalGenerationAccepted = true;
-    currentTaskStartTime = Date.now();
-    workerLog('success', `⚡ [DOLA GENERATION CONFIRMED] Dola AI confirmed prompt with NO ERRORS! Video generation underway on GPU.`);
+    workerLog('info', 'ℹ️ [DOLA RESPONSE] Received a chat response, but no generation job has been confirmed yet.');
   }
 }
 const seenFallbackApis = new Set();
@@ -1069,17 +1082,12 @@ async function syncDolaActionBarState(targetDuration = 30) {
     window.ZDOLA_TARGET_DURATION = targetDuration;
     window.ZDOLA_TARGET_RATIO = currentTask?.aspectRatio || '16:9';
 
-    // 2. Sync duration control key in Dola DOM visually
+    // Do not mutate the duration label: changing DOM text is cosmetic and
+    // does not change Dola's actual selected duration or server-side limits.
     const durationBtn = document.querySelector('button[data-testid="chat_input_action_video-duration"], [data-input-engine-actionbar-control-key="video-duration"]');
     if (durationBtn) {
-      const walker = document.createTreeWalker(durationBtn, NodeFilter.SHOW_TEXT);
-      let node;
-      while ((node = walker.nextNode())) {
-        if (/^\s*\d+(?:\.\d+)?\s*s\s*$/i.test(node.nodeValue)) {
-          node.nodeValue = `${targetDuration}s`;
-          workerLog('info', `🎯 [ZDOLA ACTIONBAR] Dola duration control toolbar visually synced to ${targetDuration}s`);
-        }
-      }
+      const actualDuration = (durationBtn.innerText || durationBtn.textContent || '').trim();
+      workerLog('info', `🎯 [ZDOLA ACTIONBAR] Actual Dola duration control reads "${actualDuration || 'unknown'}" (requested ${targetDuration}s).`);
     }
 
     // 3. Sync aspect ratio if requested
@@ -1125,12 +1133,20 @@ async function ensureCreateVideoMode() {
   const startTime = Date.now();
   let actionbarFound = false;
 
-  const isVideoActionbarMounted = () => Boolean(
-    document.querySelector('[data-input-engine-actionbar-control-key="video-duration"]') ||
-    document.querySelector('button[data-testid="chat_input_action_video-duration"]') ||
-    document.querySelector('[data-input-engine-actionbar-control-key="video-ratio"]') ||
-    document.querySelector('button[data-testid="chat_input_action_video-ratio"]')
-  );
+  // A ratio button alone is not proof that Create Videos is active.
+  // Require the video-specific duration AND ratio controls before submitting.
+  const getVideoControls = () => ({
+    duration: document.querySelector(
+      '[data-input-engine-actionbar-control-key="video-duration"], button[data-testid="chat_input_action_video-duration"]'
+    ),
+    ratio: document.querySelector(
+      '[data-input-engine-actionbar-control-key="video-ratio"], button[data-testid="chat_input_action_video-ratio"]'
+    )
+  });
+  const isVideoActionbarMounted = () => {
+    const controls = getVideoControls();
+    return Boolean(controls.duration && controls.ratio);
+  };
 
   while (Date.now() - startTime < 15000) {
     // 2. Check if Create Video actionbar is already mounted in DOM
@@ -1199,30 +1215,43 @@ async function ensureCreateVideoMode() {
   if (actionbarFound) {
     await sleep(400);
 
-    // 1. Verify and enforce 30s on duration button
+    // 1. Set the duration only if Dola actually offers the requested option.
+    // Never alter button text to pretend a server-side duration was selected.
     try {
-      const durBtn = document.querySelector(
-        '[data-input-engine-actionbar-control-key="video-duration"], button[data-testid="chat_input_action_video-duration"]'
-      );
+      const controls = getVideoControls();
+      const durBtn = controls.duration;
+      const targetDuration = Number(currentTask?.duration || 15);
       if (durBtn) {
         const durText = (durBtn.innerText || durBtn.textContent || '').trim();
-        if (!durText.includes('30s') && !durText.includes('30 s')) {
+        const normalized = durText.replace(/\s/g, '').toLowerCase();
+        if (!normalized.includes(`${targetDuration}s`) && normalized !== String(targetDuration)) {
           durBtn.click();
           await sleep(350);
-          const item30 = Array.from(document.querySelectorAll('[role="menuitem"], div[role="option"], li, button, span, .semi-dropdown-item')).find(el => {
-            const t = (el.innerText || el.textContent || '').trim().toLowerCase();
-            return t === '30s' || t === '30 s' || t === '30';
+          const options = Array.from(document.querySelectorAll('[role="menuitem"], [role="option"], li, button, span, .semi-dropdown-item'));
+          const requested = options.find(el => {
+            const t = (el.innerText || el.textContent || '').trim().toLowerCase().replace(/\s/g, '');
+            return t === `${targetDuration}s` || t === String(targetDuration);
           });
-          if (item30) {
-            item30.click();
+          if (requested) {
+            requested.click();
             await sleep(300);
-            workerLog('success', '🎬 [CREATE VIDEOS MODE] Selected 30s in Dola actionbar dropdown.');
+            const selectedText = (durBtn.innerText || durBtn.textContent || '').trim().toLowerCase().replace(/\s/g, '');
+            if (!selectedText.includes(`${targetDuration}s`) && selectedText !== String(targetDuration)) {
+              throw new Error(`Dola did not confirm the requested ${targetDuration}s duration.`);
+            }
+            workerLog('success', `🎬 [CREATE VIDEOS MODE] Dola duration set to ${targetDuration}s.`);
           } else {
+            const available = options.map(el => (el.innerText || el.textContent || '').trim())
+              .filter(t => /^(4|5|6|7|8|9|10|11|12|13|14|15|30)\s*s?$/i.test(t))
+              .filter((t, i, arr) => arr.indexOf(t) === i);
             document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true }));
+            workerLog('warn', `⚠️ [CREATE VIDEOS MODE] Dola does not expose a ${targetDuration}s option. Available duration options: ${available.join(', ') || 'could not be read'}.`);
           }
         }
       }
-    } catch (_) {}
+    } catch (err) {
+      workerLog('warn', `⚠️ [CREATE VIDEOS MODE] Duration selection could not be verified: ${err.message}`);
+    }
 
     // 2. Verify and enforce aspect ratio
     try {
@@ -1250,11 +1279,17 @@ async function ensureCreateVideoMode() {
       }
     } catch (_) {}
 
-    workerLog('success', '🎬 [CREATE VIDEOS MODE] Verified Dola Video Creation actionbar is active (Seedance 2.5 • 30s).');
+    const controls = getVideoControls();
+    if (!controls.duration || !controls.ratio) {
+      workerLog('error', '❌ [CREATE VIDEOS MODE] Required video controls disappeared; refusing to submit prompt.');
+      return false;
+    }
+    const actualDuration = (controls.duration.innerText || controls.duration.textContent || '').trim() || 'unknown';
+    workerLog('success', `🎬 [CREATE VIDEOS MODE] Verified video-specific duration and aspect-ratio controls. Current Dola duration: ${actualDuration}.`);
     return true;
   }
 
-  workerLog('warn', '⚠️ [CREATE VIDEOS MODE] Video Creation actionbar not detected within timeout, proceeding with direct payload interception.');
+  workerLog('error', '❌ [CREATE VIDEOS MODE] Video-specific duration and aspect-ratio controls were not both detected within 15 seconds. Prompt was not submitted.');
   return false;
 }
 
