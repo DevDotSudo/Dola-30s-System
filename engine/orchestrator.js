@@ -257,7 +257,14 @@ class StudioOrchestrator {
           account,
           task,
           this.saveFolder,
-          (type, msg) => this.log(type, msg)
+          (type, msg) => this.log(type, msg),
+          (response) => {
+            task.dolaResponse = response;
+            if (response.correlation === 'new-observation-only') {
+              this.log('warn', '[DOLA RESPONSE CAPTURED, CORRELATION LIMITED] Task #' + task.promptIndex + ': ' + response.text);
+            }
+            this.broadcastStatus();
+          }
         );
 
         if (result && result.success) {
@@ -284,11 +291,15 @@ class StudioOrchestrator {
           this.log('error', `❌ [SESSION DEAD] Account "${account.name}" session expired. Marking dead.`);
           updateAccountStatus(account.id, 'dead', 0);
           this.focusedAccountId = null;
+        } else if (/SUBMISSION_OUTCOME_UNKNOWN|DOLA_ACCEPTANCE_UNKNOWN|DOLA_DURATION_UNSUPPORTED|DOLA_CONFIRMATION_REQUIRED|DOLA_HIGH_DEMAND_NO_AUTO_RETRY/.test(err.message)) {
+          // Ambiguous submissions and confirmation requests must not be blindly replayed.
+          task.status = /DOLA_CONFIRMATION_REQUIRED/.test(err.message) ? 'needs_confirmation' : 'failed';
+          this.failedCount++;
+          this.log('warn', '[NO AUTOMATIC RETRY] Task #' + task.promptIndex + ' stopped safely: ' + err.message);
         } else if (classification.isHighDemand) {
-          task.status = 'pending';
-          this.promptsPosted--;
-          this.log('warn', `⚠️ [HIGH DEMAND] ByteDance GPU capacity full. Waiting 5s and retrying...`);
-          await new Promise(r => setTimeout(r, 5000));
+          task.status = 'failed';
+          this.failedCount++;
+          this.log('warn', '[HIGH DEMAND] Dola capacity error returned; automatic retry is disabled for this task.');
         } else {
           // Automatic retry with backoff for transient issues
           task.retryCount = (task.retryCount || 0) + 1;

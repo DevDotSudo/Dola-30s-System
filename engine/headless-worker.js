@@ -108,13 +108,14 @@ function attachLightweightNetworkBlocker(ses) {
   } catch (_) {}
 }
 
-function dispatchHeadlessWorkerTask(account, task, saveFolder, onTelemetryLog) {
+function dispatchHeadlessWorkerTask(account, task, saveFolder, onTelemetryLog, onDolaResponse) {
   return new Promise(async (resolve, reject) => {
     let workerWin = null;
     let isFinished = false;
     let isPromptSubmitted = false;
     let isPromptSubmissionAttempted = false;
     const targetTaskId = String(task.id || task.taskId || '');
+    const workerRunId = require('crypto').randomUUID();
 
     // Timeout guard: 3 hours for deep queues
     const timeoutTimer = setTimeout(() => {
@@ -133,6 +134,7 @@ function dispatchHeadlessWorkerTask(account, task, saveFolder, onTelemetryLog) {
       }
 
       ipcMain.removeListener('worker-telemetry', handleTelemetry);
+      ipcMain.removeListener('worker-dola-response', handleDolaResponse);
       ipcMain.removeListener('worker-video-resolved', handleVideoResolved);
       ipcMain.removeListener('worker-error', handleWorkerError);
       ipcMain.removeListener('worker-account-limit', handleAccountLimit);
@@ -150,6 +152,25 @@ function dispatchHeadlessWorkerTask(account, task, saveFolder, onTelemetryLog) {
       } else {
         resolve(result);
       }
+    }
+
+    function handleDolaResponse(event, data) {
+      if (isFinished || !data) return;
+      if (String(data.taskId) !== targetTaskId || String(data.workerRunId) !== workerRunId) return;
+      if (typeof data.text !== 'string' || !data.text.trim()) return;
+      const response = {
+        taskId: targetTaskId,
+        workerRunId: workerRunId,
+        conversationId: typeof data.conversationId === 'string' ? data.conversationId : null,
+        messageId: typeof data.messageId === 'string' ? data.messageId : null,
+        source: String(data.source || 'unknown'),
+        text: data.text,
+        receivedAt: typeof data.receivedAt === 'string' ? data.receivedAt : new Date().toISOString(),
+        correlation: String(data.correlation || 'new-observation-only'),
+        isFinal: Boolean(data.isFinal)
+      };
+      if (onDolaResponse) onDolaResponse(response);
+      if (onTelemetryLog) onTelemetryLog('info', '[DOLA RESPONSE CAPTURED] ' + response.text);
     }
 
     function handleTelemetry(event, data) {
@@ -251,6 +272,7 @@ function dispatchHeadlessWorkerTask(account, task, saveFolder, onTelemetryLog) {
     }
 
     ipcMain.on('worker-telemetry', handleTelemetry);
+    ipcMain.on('worker-dola-response', handleDolaResponse);
     ipcMain.on('worker-video-resolved', handleVideoResolved);
     ipcMain.on('worker-error', handleWorkerError);
     ipcMain.on('worker-account-limit', handleAccountLimit);
@@ -571,6 +593,7 @@ function dispatchHeadlessWorkerTask(account, task, saveFolder, onTelemetryLog) {
 
       // Pure Video Generation Payload (Zdola 30s bypass mode)
       const taskPayload = {
+        workerRunId,
         accountId: account.id,
         accountName: account.name,
         taskId: task.id,

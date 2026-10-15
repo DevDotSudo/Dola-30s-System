@@ -568,6 +568,10 @@ function processScrapedChatText(source, text) {
   if (currentTask?.prompt && (clean === currentTask.prompt.trim() || clean.includes(currentTask.prompt.trim()))) return;
   if (/^(send|cancel|confirm|fast|pro|upload|select|clear chat|regenerate|copy|retry|share)$/i.test(clean)) return;
 
+  // Ignore exact text already present before this task; chain polling may replay old turns.
+  const normalizedClean = normalizeObservedText(clean);
+  if (baselineChatTexts.has(normalizedClean)) return;
+
   // 5. Deduplicate
   if (loggedDolaReplies.has(clean)) return;
 
@@ -578,8 +582,25 @@ function processScrapedChatText(source, text) {
 
   loggedDolaReplies.add(clean);
 
+  // Emit Dola's exact response as structured task-scoped data, separately from logs.
+  const responseKey = String(currentTask?.workerRunId || '') + ':' + source + ':' + normalizedClean;
+  if (!reportedResponseKeys.has(responseKey)) {
+    reportedResponseKeys.add(responseKey);
+    ipcRenderer.send('worker-dola-response', {
+      taskId: currentTask?.taskId,
+      workerRunId: currentTask?.workerRunId,
+      conversationId: activeConversationId || null,
+      messageId: null,
+      source: source,
+      text: clean,
+      receivedAt: new Date().toISOString(),
+      correlation: activeConversationId ? 'conversation-identified' : 'new-observation-only',
+      isFinal: source === 'api:stream_complete' || source === 'dom:observer'
+    });
+  }
+
   // Scraped from Dola: Log immediately to terminal & UI
-  workerLog('info', `💬 [DOLA CHAT] "${clean}"`);
+  workerLog('info', '[DOLA CHAT] "' + clean + '"');
 
   // Detect Dola video completion notice
   const isVideoReadyNotice = (
@@ -1827,6 +1848,8 @@ ipcRenderer.on('start-worker-task', async (event, taskData) => {
     currentTaskStartTime = Date.now();
     hasLoggedPayloadLock = false;
     loggedDolaReplies.clear();
+    reportedResponseKeys.clear();
+    baselineChatTexts = snapshotExistingAssistantText();
     isGlobalGenerationAccepted = false;
     isCooking = false;
     isPromptDispatched = false;
