@@ -1714,17 +1714,10 @@ async function monitorGeneration() {
 
     // Silence, generic cards, and elapsed time are not acceptance evidence.
     if (!isGenerationAccepted && !isGlobalGenerationAccepted) {
-      if (Date.now() - promptAcknowledgeStart > 7000) {
+      if (Date.now() - promptAcknowledgeStart > 7000 && Date.now() - promptAcknowledgeStart < 7500) {
         workerLog('warn', '[ACCEPTANCE PENDING] No generation-specific evidence yet; waiting without resubmitting.');
       }
       continue;
-    }
-      // After 7 seconds with zero errors: Dola prompt is confirmed accepted & rendering on GPU!
-      isGenerationAccepted = true;
-      isGlobalGenerationAccepted = true;
-      currentTaskStartTime = Date.now();
-      periodicTicker = Date.now();
-      workerLog('success', `⚡ [DOLA GENERATION CONFIRMED] Dola prompt submitted with NO ERRORS! Video generation underway on GPU.`);
     }
 
     // 6. SHOW GENERATION PROGRESS HEARTBEAT (every 15s)
