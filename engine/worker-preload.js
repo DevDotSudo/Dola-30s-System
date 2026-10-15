@@ -15,6 +15,8 @@ let currentTaskStartTime = Date.now();
 let activeConversationId = null;
 let currentTaskEta = null;
 let streamedTextAccumulator = '';
+let baselineChatTexts = new Set();
+let reportedResponseKeys = new Set();
 
 function parseDolaEta(text) {
   if (!text || typeof text !== 'string') return null;
@@ -67,6 +69,31 @@ let activeConfirmTimeout = null;
 let isSubmitting = false;
 
 const sleep = ms => new Promise(res => setTimeout(res, ms));
+
+function normalizeObservedText(value) {
+  return String(value || '').replace(/\\s+/g, ' ').trim();
+}
+
+function snapshotExistingAssistantText() {
+  const texts = new Set();
+  try {
+    const selectors = [
+      '.semi-chat-message', '.semi-chat-content', '.semi-chat-item',
+      '[class*="chat-item"]', '[class*="chat_item"]',
+      '[class*="chat-message"]', '[class*="chat_message"]',
+      '[class*="message-bubble"]', '[class*="message_bubble"]',
+      '[class*="markdown-body"]', '[class*="prose"]',
+      '[data-role="assistant"]', '[data-message-role="assistant"]',
+      '[data-message-id]', 'div[class*="bubble"]', 'div[class*="answer"]'
+    ];
+    for (const el of document.querySelectorAll(selectors.join(', '))) {
+      if (el.closest('.semi-chat-item-user, [class*="item-user"], [class*="item-right"], [class*="user-message"], [data-role="user"]')) continue;
+      const value = normalizeObservedText(el.innerText || el.textContent);
+      if (value) texts.add(value);
+    }
+  } catch (_) {}
+  return texts;
+}
 
 function workerLog(type, message) {
   try {
