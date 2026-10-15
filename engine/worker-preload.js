@@ -1284,8 +1284,11 @@ async function submitViaDom(promptText, force = false) {
     // In Create Videos Mode (zdola mode), send the pure video prompt directly — zero chat overhead!
     const fullPrompt = cleanPrompt;
 
-    // 1. Enforce Pro Mode & zdola Action-Bar Sync
-    await ensureCreateVideoMode();
+    // Do not send prompts to ordinary chat if Create Videos mode is not verified.
+    const videoModeReady = await ensureCreateVideoMode();
+    if (!videoModeReady) {
+      throw new Error('Create Videos mode could not be verified; prompt was not submitted.');
+    }
     await syncDolaActionBarState(currentTask?.duration || 30);
 
     // 2. Attach Reference Image if Image-to-Video task
@@ -1383,57 +1386,11 @@ async function submitViaDom(promptText, force = false) {
     editor.focus();
     workerLog('info', `✍️ [DOM COMPOSER] Requesting trusted typing with prompt: "${cleanPrompt.slice(0, 45)}..."`);
 
-    // 4. Invoke trusted Electron typing and smart send
-    let submittedSuccessfully = false;
-    try {
-      const res = await ipcRenderer.invoke('worker-trusted-submit', { fullPrompt });
-      if (res && res.success && res.verified) {
-        submittedSuccessfully = true;
-      }
-    } catch (ipcErr) {
-      workerLog('warn', `⚠️ [TRUSTED SUBMIT WARN]: ${ipcErr.message}`);
-    }
-
-    // 5. In-Page DOM Fallback (zdola input & send click) if not verified
-    if (!submittedSuccessfully) {
-      workerLog('info', `🔄 [DOM FALLBACK SUBMIT] Running in-page verified submit...`);
-      try {
-        editor.focus();
-        const p = editor.querySelector('p') || editor;
-        p.textContent = fullPrompt;
-        editor.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, data: fullPrompt, inputType: 'insertText' }));
-        editor.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, data: fullPrompt, inputType: 'insertText' }));
-        editor.dispatchEvent(new Event('input', { bubbles: true }));
-        editor.dispatchEvent(new Event('change', { bubbles: true }));
-      } catch (_) {}
-
-      await sleep(300);
-
-      const sendBtnSelectors = [
-        'button[data-testid="chat_input_send_button"]',
-        '#flow-end-msg-send',
-        'button[type="submit"]',
-        'button[aria-label*="send" i]',
-        'button[title*="send" i]',
-        'button[data-testid*="send" i]',
-        'button[aria-label*="发送"]',
-        'div[role="button"][class*="send"]',
-        'button[class*="send"]'
-      ];
-
-      for (const sel of sendBtnSelectors) {
-        const el = document.querySelector(sel);
-        const btn = el ? (el.closest('button, div[role="button"]') || el) : null;
-        if (btn && (btn.offsetWidth > 0 || btn.offsetHeight > 0)) {
-          btn.disabled = false;
-          btn.setAttribute('aria-disabled', 'false');
-          btn.click();
-          break;
-        }
-      }
-
-      editor.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-      editor.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+    // Submit exactly once through the trusted input handler. If verification fails,
+    // stop instead of triggering DOM click and Enter fallbacks that can duplicate jobs.
+    const res = await ipcRenderer.invoke('worker-trusted-submit', { fullPrompt });
+    if (!res || !res.success || !res.verified) {
+      throw new Error(res?.error || 'Dola prompt submission could not be verified.');
     }
 
     // Automatically confirm 18+ age popup if present

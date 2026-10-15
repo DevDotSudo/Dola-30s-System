@@ -120,7 +120,7 @@ function dispatchHeadlessWorkerTask(account, task, saveFolder, onTelemetryLog) {
       cleanup('Task timed out after 3 hours.');
     }, 3 * 60 * 60 * 1000);
 
-    function cleanup(errorMsg = null) {
+    function cleanup(errorMsg = null, result = null) {
       if (isFinished) return;
       isFinished = true;
       activeWorkerCleanups.delete(cleanup);
@@ -147,7 +147,7 @@ function dispatchHeadlessWorkerTask(account, task, saveFolder, onTelemetryLog) {
       if (errorMsg) {
         reject(new Error(errorMsg));
       } else {
-        resolve();
+        resolve(result);
       }
     }
 
@@ -158,10 +158,55 @@ function dispatchHeadlessWorkerTask(account, task, saveFolder, onTelemetryLog) {
       }
     }
 
-    function handleVideoResolved(event, data) {
-      if (isFinished) return;
-      if (data && String(data.taskId) === targetTaskId) {
-        cleanup();
+    let isResolvingVideo = false;
+
+    async function handleVideoResolved(event, data) {
+      if (isFinished || isResolvingVideo) return;
+      if (!data || String(data.taskId) !== targetTaskId) return;
+
+      isResolvingVideo = true;
+      try {
+        const videoUrl = typeof data.videoUrl === 'string' ? data.videoUrl.trim() : '';
+        let parsedUrl;
+        try {
+          parsedUrl = new URL(videoUrl);
+        } catch (_) {
+          throw new Error('Dola returned an invalid video URL.');
+        }
+        if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+          throw new Error('Dola returned an unsupported video URL protocol.');
+        }
+
+        const taskLabel = String(task.promptIndex || task.id || Date.now())
+          .replace(/[^a-zA-Z0-9_-]/g, '_');
+        const filename = `dola_video_${taskLabel}_${Date.now()}.mp4`;
+        if (onTelemetryLog) {
+          onTelemetryLog('info', `⬇️ [DOWNLOAD] Dola finished rendering; downloading video for task #${taskLabel}...`);
+        }
+
+        const downloaded = await downloadStreamToFile(videoUrl, saveFolder, filename, onTelemetryLog);
+        if (!downloaded || !downloaded.filePath || !fs.existsSync(downloaded.filePath)) {
+          throw new Error('Video download did not produce an output file.');
+        }
+
+        const stats = fs.statSync(downloaded.filePath);
+        if (!stats.size) {
+          try { fs.unlinkSync(downloaded.filePath); } catch (_) {}
+          throw new Error('Downloaded video file is empty.');
+        }
+
+        if (onTelemetryLog) {
+          onTelemetryLog('success', `✅ [DOWNLOAD COMPLETE] Saved ${filename} (${downloaded.sizeMB} MB).`);
+        }
+        cleanup(null, {
+          success: true,
+          filename,
+          filePath: downloaded.filePath,
+          fileSizeMB: downloaded.sizeMB,
+          duration: Number(data.duration) || Number(task.duration) || 30
+        });
+      } catch (err) {
+        cleanup(`Video resolved but download failed: ${err.message}`);
       }
     }
 
@@ -324,18 +369,10 @@ function dispatchHeadlessWorkerTask(account, task, saveFolder, onTelemetryLog) {
           await new Promise(r => setTimeout(r, 150));
         }
 
-        // STEP 4: If send button is still disabled, wake up Tiptap state with a physical keystroke!
-        if (buttonState.isDisabled) {
-          workerWin.webContents.sendInputEvent({ type: 'char', keyCode: ' ' });
-          await new Promise(r => setTimeout(r, 50));
-          workerWin.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Backspace' });
-          workerWin.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Backspace' });
-          await new Promise(r => setTimeout(r, 150));
-        }
-
-        // STEP 5: Click active Send Button
+        // STEP 4: Submit once only. Never force-enable the control or combine
+        // DOM click, physical mouse click, and Enter; those can enqueue duplicates.
         const sendClick = await workerWin.webContents.executeJavaScript(`(() => {
-          const sendBtnSelectors = [
+          const selectors = [
             'button[data-testid="chat_input_send_button"]',
             '#flow-end-msg-send',
             'button[type="submit"]',
@@ -347,53 +384,26 @@ function dispatchHeadlessWorkerTask(account, task, saveFolder, onTelemetryLog) {
             'button[class*="send"]'
           ];
           let sendBtn = null;
-          for (const sel of sendBtnSelectors) {
-            const el = document.querySelector(sel);
-            const btn = el ? (el.closest('button, div[role="button"]') || el) : null;
+          for (const selector of selectors) {
+            const candidate = document.querySelector(selector);
+            const btn = candidate ? (candidate.closest('button, div[role="button"]') || candidate) : null;
             if (btn && (btn.offsetWidth > 0 || btn.offsetHeight > 0)) {
               sendBtn = btn;
               break;
             }
           }
-
-          if (sendBtn) {
-            sendBtn.disabled = false;
-            sendBtn.setAttribute('aria-disabled', 'false');
-            const r = sendBtn.getBoundingClientRect();
-            sendBtn.click();
-            return {
-              clicked: true,
-              coords: {
-                x: Math.round(r.x + r.width / 2),
-                y: Math.round(r.y + r.height / 2)
-              }
-            };
+          if (!sendBtn) return { clicked: false, reason: 'Send button not found' };
+          if (sendBtn.disabled || sendBtn.getAttribute('aria-disabled') === 'true') {
+            return { clicked: false, reason: 'Send button is disabled after prompt insertion' };
           }
-          return { clicked: false, coords: null };
+          sendBtn.click();
+          return { clicked: true };
         })()`);
 
-        if (sendClick?.clicked) {
-          if (onTelemetryLog) onTelemetryLog('success', `🎯 [SEND BUTTON CLICKED] Send button triggered successfully!`);
-          if (sendClick.coords && sendClick.coords.x > 0 && sendClick.coords.y > 0) {
-            workerWin.webContents.sendInputEvent({ type: 'mouseMove', x: sendClick.coords.x, y: sendClick.coords.y });
-            await new Promise(r => setTimeout(r, 40));
-            workerWin.webContents.sendInputEvent({ type: 'mouseDown', x: sendClick.coords.x, y: sendClick.coords.y, button: 'left', clickCount: 1 });
-            await new Promise(r => setTimeout(r, 40));
-            workerWin.webContents.sendInputEvent({ type: 'mouseUp', x: sendClick.coords.x, y: sendClick.coords.y, button: 'left' });
-          }
+        if (!sendClick?.clicked) {
+          return { success: false, verified: false, error: sendClick?.reason || 'Send button unavailable' };
         }
-
-        // Fallback Enter key
-        await workerWin.webContents.executeJavaScript(`(() => {
-          const ed = document.querySelector('div.tiptap.ProseMirror, [contenteditable="true"], textarea');
-          if (ed) {
-            ed.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-            ed.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-            ed.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-          }
-        })()`);
-        workerWin.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Return' });
-        workerWin.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Return' });
+        if (onTelemetryLog) onTelemetryLog('info', '📨 [SINGLE SUBMIT] Clicked the enabled Dola send button once.');
 
         // STEP 6: Confirm 18+ age popup if it appears
         for (let i = 0; i < 4; i++) {
