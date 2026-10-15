@@ -113,6 +113,7 @@ function dispatchHeadlessWorkerTask(account, task, saveFolder, onTelemetryLog) {
     let workerWin = null;
     let isFinished = false;
     let isPromptSubmitted = false;
+    let isPromptSubmissionAttempted = false;
     const targetTaskId = String(task.id || task.taskId || '');
 
     // Timeout guard: 3 hours for deep queues
@@ -229,7 +230,7 @@ function dispatchHeadlessWorkerTask(account, task, saveFolder, onTelemetryLog) {
     let ackInterval = null;
 
     function handleWorkerReady(event, data) {
-      if (isFinished || isPromptSubmitted || !isNavigationFinished || !workerWin || workerWin.isDestroyed()) return;
+      if (isFinished || isPromptSubmitted || isPromptSubmissionAttempted || !isNavigationFinished || !workerWin || workerWin.isDestroyed()) return;
       if (workerWin.webContents.isLoading()) return;
       const curUrl = workerWin.webContents.getURL() || '';
       if (!curUrl.includes('dola.com/chat')) return;
@@ -258,12 +259,12 @@ function dispatchHeadlessWorkerTask(account, task, saveFolder, onTelemetryLog) {
 
     try { ipcMain.removeHandler('worker-trusted-submit'); } catch (_) {}
     ipcMain.handle('worker-trusted-submit', async (event, { fullPrompt }) => {
-      if (isFinished || !workerWin || workerWin.isDestroyed()) return { success: false, error: 'Worker destroyed' };
-      if (isPromptSubmitted) {
-        return { success: true, verified: true, duplicate: true };
-      }
+      if (isFinished || !workerWin || workerWin.isDestroyed()) return { success: false, verified: false, error: 'Worker destroyed' };
+      if (isPromptSubmissionAttempted || isPromptSubmitted) return { success: false, verified: false, duplicate: true, error: 'Submission attempt already claimed; duplicate submission blocked.' };
+      if (typeof fullPrompt !== 'string' || !fullPrompt.trim()) return { success: false, verified: false, error: 'Prompt is empty.' };
+      isPromptSubmissionAttempted = true;
       try {
-        if (onTelemetryLog) onTelemetryLog('info', `✍️ [TRUSTED INPUT] Typing prompt (${fullPrompt.length} chars) via bulletproof input engine...`);
+        if (onTelemetryLog) onTelemetryLog('info', `[TRUSTED INPUT] Typing prompt (${fullPrompt.length} chars) via trusted input engine...`);
 
         // STEP 1: Focus ProseMirror editor and select contents
         const focusResult = await workerWin.webContents.executeJavaScript(`(() => {
@@ -450,7 +451,7 @@ function dispatchHeadlessWorkerTask(account, task, saveFolder, onTelemetryLog) {
             clearInterval(ackInterval);
             ackInterval = null;
           }
-          if (onTelemetryLog) onTelemetryLog('success', `✅ [SUBMISSION VERIFIED] Dola accepted prompt! Editor cleared and dispatch confirmed.`);
+          if (onTelemetryLog) onTelemetryLog('info', '[SUBMIT ACTION VERIFIED] Editor cleared after one send action; Dola acceptance is still pending.');
           return { success: true, verified: true };
         } else {
           if (onTelemetryLog) onTelemetryLog('warn', `⚠️ [SUBMISSION NOTICE] Editor not cleared yet; falling back to in-page submit...`);

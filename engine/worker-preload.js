@@ -5,6 +5,10 @@
  */
 
 const { ipcRenderer } = require('electron');
+const { createWorkerStateMachine, STATES: WORKER_STATES } = require('./worker-state-machine');
+const workerStateMachine = createWorkerStateMachine();
+let workerSubmissionAttempted = false;
+let lastCreateVideoCheck = { category: 'mode', reason: 'not checked' };
 
 let currentTask = null;
 let currentTaskStartTime = Date.now();
@@ -66,12 +70,25 @@ const sleep = ms => new Promise(res => setTimeout(res, ms));
 
 function workerLog(type, message) {
   try {
-    ipcRenderer.send('worker-telemetry', {
-      taskId: currentTask?.taskId,
-      type: type || 'info',
-      message: String(message)
-    });
+    ipcRenderer.send('worker-telemetry', { taskId: currentTask?.taskId, type: type || 'info', message: String(message) });
   } catch (_) {}
+}
+function moveWorkerState(nextState, evidence = {}) {
+  const current = workerStateMachine.getState();
+  if (current === nextState) return true;
+  if (workerStateMachine.isTerminal()) {
+    workerLog('warn', `[WORKER STATE] Terminal state ${current}; ignored transition to ${nextState}.`);
+    return false;
+  }
+  try {
+    const event = workerStateMachine.transition(nextState, evidence);
+    workerLog('info', `[WORKER STATE] ${event.from} -> ${event.to} ${JSON.stringify(evidence)}`);
+    return true;
+  } catch (err) {
+    workerLog('error', `[WORKER STATE INVARIANT] ${err.message}`);
+    try { if (!workerStateMachine.isTerminal()) workerStateMachine.transition(WORKER_STATES.INTERNAL_FAILURE, { error: err.message }); } catch (_) {}
+    return false;
+  }
 }
 
 /* ==========================================================================
@@ -96,12 +113,12 @@ function classifyDolaResponse(text) {
 
   // 2. Detect genuine positive acceptance notices
   const isAcceptedNotice = !isConfirmationRequest && (
-    /video will be generated/i.test(text) ||
-    /ready in/i.test(text) ||
+    /the video will be generated/i.test(text) ||
+    /your video generation (?:has been )?started/i.test(text) ||
+    /generation (?:has been )?queued/i.test(text) ||
+    /ready in \d+\s*(?:hours?|hrs?|minutes?|mins?)/i.test(text) ||
     /I['’]ll (?:send it to you|let you know) when it['’]s done/i.test(text) ||
-    /generate your \d+-second/i.test(text) ||
-    /Seedance/i.test(text) ||
-    /Dreamina/i.test(text)
+    /generate your \d+-second video/i.test(text)
   );
 
   const isUnsupportedDuration = /(?:currently supports durations? from\s*4\s*to\s*15\s*seconds?|only supports?\s*(?:a\s*)?(?:maximum of\s*)?15\s*seconds?|nearest supported duration of\s*15\s*seconds?)/i.test(text);
@@ -456,7 +473,10 @@ function handleCreationObject(cre) {
   if (!isGlobalGenerationAccepted && (cre.creation_id || cre.status === 1 || cre.status_text === 'running' || cre.status_text === 'queued')) {
     isGlobalGenerationAccepted = true;
     currentTaskStartTime = Date.now();
-    workerLog('success', `⚡ [DOLA GENERATION CONFIRMED] Dola creation registered (ID: ${cre.creation_id || 'active'}) with NO ERRORS! Video generation in progress on GPU.`);
+    if (workerStateMachine.getState() === WORKER_STATES.AWAITING_ACCEPTANCE) {
+      moveWorkerState(WORKER_STATES.ACCEPTED, { source: 'creation_object', creationId: cre.creation_id || null, status: cre.status_text || cre.status || null });
+    }
+    workerLog('success', `[DOLA GENERATION ACCEPTED] Creation registered (ID: ${cre.creation_id || 'active'}).`);
   }
 
   // Completion detection (status === 2 or status_text === 'success')
@@ -582,7 +602,10 @@ function processScrapedChatText(source, text) {
   if (isVideoGenerationNotice && !isGlobalGenerationAccepted) {
     isGlobalGenerationAccepted = true;
     currentTaskStartTime = Date.now();
-    workerLog('success', `🎬 [DOLA GENERATION CONFIRMED] ${clean}`);
+    if (workerStateMachine.getState() === WORKER_STATES.AWAITING_ACCEPTANCE) {
+      moveWorkerState(WORKER_STATES.ACCEPTED, { source: 'explicit_dola_acceptance_text', text: clean.slice(0, 500) });
+    }
+    workerLog('success', `[DOLA GENERATION ACCEPTED] ${clean}`);
   }
 
   // A duration-limit response is not a generation acceptance. Do not auto-confirm
@@ -596,32 +619,29 @@ function processScrapedChatText(source, text) {
     return;
   }
 
-  // Handle confirmation requests (e.g. "Confirm if you'd like me to proceed", "Reply 'Confirm'")
+  // Confirmation requests require a user decision; never auto-confirm.
   if (classified.isConfirmationRequest) {
-    if (!activeConfirmTimeout) {
-      workerLog('info', `✅ [DOLA CONFIRMATION REQUEST] Dola requested confirmation ("${clean.slice(0, 80)}..."). Replying with confirmation to trigger generation...`);
-      activeConfirmTimeout = setTimeout(async () => {
-        activeConfirmTimeout = null;
-        await sendChatReply("Confirm. Proceed with video generation now.");
-      }, 1500);
+    if (workerStateMachine.getState() === WORKER_STATES.AWAITING_ACCEPTANCE) {
+      moveWorkerState(WORKER_STATES.NEEDS_CONFIRMATION, { source: 'dola_confirmation_request', text: clean.slice(0, 500) });
     }
+    workerLog('warn', `[DOLA CONFIRMATION REQUIRED] No automatic reply: "${clean.slice(0, 160)}"`);
+    ipcRenderer.send('worker-error', { taskId: currentTask?.taskId, error: `DOLA_CONFIRMATION_REQUIRED: ${clean}` });
     return;
   }
-
-  // Handle high demand auto-retry
   if (classified.isHighDemand) {
-    workerLog('warn', `⚠️ [HIGH DEMAND] Dola servers are currently at capacity ("${clean}"). Auto-retrying prompt submission in 5s...`);
-    if (!activeResubmitTimeout) {
-      activeResubmitTimeout = setTimeout(async () => {
-        activeResubmitTimeout = null;
-        await submitViaDom(currentTask?.prompt || '', true);
-      }, 5000);
+    if (workerStateMachine.getState() === WORKER_STATES.AWAITING_ACCEPTANCE) {
+      moveWorkerState(WORKER_STATES.REJECTED, { source: 'dola_capacity_error', text: clean.slice(0, 500) });
     }
+    workerLog('error', '[DOLA CAPACITY ERROR] Automatic resubmission is blocked.');
+    ipcRenderer.send('worker-error', { taskId: currentTask?.taskId, error: `DOLA_HIGH_DEMAND_NO_AUTO_RETRY: ${clean}` });
     return;
   }
 
   // Handle hard errors (only when not accepted)
   if (classified.isError) {
+    if (workerStateMachine.getState() === WORKER_STATES.AWAITING_ACCEPTANCE) {
+      moveWorkerState(WORKER_STATES.REJECTED, { source: 'dola_chat_error', reason: classified.reason, text: clean.slice(0, 500) });
+    }
     workerLog('error', `❌ [DOLA CHAT ERROR] "${clean}" (${classified.reason})`);
     if (classified.isLimit) {
       ipcRenderer.send('worker-account-limit', {
@@ -1213,83 +1233,74 @@ async function ensureCreateVideoMode() {
   }
 
   if (actionbarFound) {
+    lastCreateVideoCheck = { category: 'settings', reason: 'settings not yet validated' };
+    if (!moveWorkerState(WORKER_STATES.VALIDATE_SETTINGS, { durationControl: true, ratioControl: true })) return false;
     await sleep(400);
-
-    // 1. Set the duration only if Dola actually offers the requested option.
-    // Never alter button text to pretend a server-side duration was selected.
-    try {
-      const controls = getVideoControls();
-      const durBtn = controls.duration;
-      const targetDuration = Number(currentTask?.duration || 15);
-      if (durBtn) {
-        const durText = (durBtn.innerText || durBtn.textContent || '').trim();
-        const normalized = durText.replace(/\s/g, '').toLowerCase();
-        if (!normalized.includes(`${targetDuration}s`) && normalized !== String(targetDuration)) {
-          durBtn.click();
-          await sleep(350);
-          const options = Array.from(document.querySelectorAll('[role="menuitem"], [role="option"], li, button, span, .semi-dropdown-item'));
-          const requested = options.find(el => {
-            const t = (el.innerText || el.textContent || '').trim().toLowerCase().replace(/\s/g, '');
-            return t === `${targetDuration}s` || t === String(targetDuration);
-          });
-          if (requested) {
-            requested.click();
-            await sleep(300);
-            const selectedText = (durBtn.innerText || durBtn.textContent || '').trim().toLowerCase().replace(/\s/g, '');
-            if (!selectedText.includes(`${targetDuration}s`) && selectedText !== String(targetDuration)) {
-              throw new Error(`Dola did not confirm the requested ${targetDuration}s duration.`);
-            }
-            workerLog('success', `🎬 [CREATE VIDEOS MODE] Dola duration set to ${targetDuration}s.`);
-          } else {
-            const available = options.map(el => (el.innerText || el.textContent || '').trim())
-              .filter(t => /^(4|5|6|7|8|9|10|11|12|13|14|15|30)\s*s?$/i.test(t))
-              .filter((t, i, arr) => arr.indexOf(t) === i);
-            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true }));
-            workerLog('warn', `⚠️ [CREATE VIDEOS MODE] Dola does not expose a ${targetDuration}s option. Available duration options: ${available.join(', ') || 'could not be read'}.`);
-          }
-        }
-      }
-    } catch (err) {
-      workerLog('warn', `⚠️ [CREATE VIDEOS MODE] Duration selection could not be verified: ${err.message}`);
-    }
-
-    // 2. Verify and enforce aspect ratio
-    try {
-      const targetRatio = currentTask?.aspectRatio || '16:9';
-      const ratioBtn = document.querySelector(
-        '[data-input-engine-actionbar-control-key="video-ratio"], button[data-testid="chat_input_action_video-ratio"]'
-      );
-      if (ratioBtn) {
-        const ratioText = (ratioBtn.innerText || ratioBtn.textContent || '').trim();
-        if (!ratioText.includes(targetRatio)) {
-          ratioBtn.click();
-          await sleep(350);
-          const ratioItem = Array.from(document.querySelectorAll('[role="menuitem"], div[role="option"], li, button, span, .semi-dropdown-item')).find(el => {
-            const t = (el.innerText || el.textContent || '').trim();
-            return t.includes(targetRatio);
-          });
-          if (ratioItem) {
-            ratioItem.click();
-            await sleep(300);
-            workerLog('info', `🎯 [CREATE VIDEOS MODE] Selected ${targetRatio} aspect ratio.`);
-          } else {
-            document.body.click();
-          }
-        }
-      }
-    } catch (_) {}
-
     const controls = getVideoControls();
-    if (!controls.duration || !controls.ratio) {
-      workerLog('error', '❌ [CREATE VIDEOS MODE] Required video controls disappeared; refusing to submit prompt.');
+    const visibleEnabled = el => Boolean(el && (el.offsetWidth > 0 || el.offsetHeight > 0) && !el.disabled && el.getAttribute('aria-disabled') !== 'true');
+    if (!visibleEnabled(controls.duration) || !visibleEnabled(controls.ratio)) {
+      lastCreateVideoCheck = { category: 'mode', reason: 'video controls missing, hidden, or disabled' };
+      workerLog('error', '[MODE BLOCKED] Video-specific controls are missing, hidden, or disabled.');
       return false;
     }
-    const actualDuration = (controls.duration.innerText || controls.duration.textContent || '').trim() || 'unknown';
-    workerLog('success', `🎬 [CREATE VIDEOS MODE] Verified video-specific duration and aspect-ratio controls. Current Dola duration: ${actualDuration}.`);
+
+    const targetDuration = Number(currentTask?.duration || 30);
+    let durationText = (controls.duration.innerText || controls.duration.textContent || '').trim();
+    const normalize = value => String(value || '').toLowerCase().replace(/\s/g, '');
+    const matchesDuration = value => [`${targetDuration}s`, String(targetDuration), `${targetDuration}sec`, `${targetDuration}seconds`].includes(normalize(value));
+    if (!matchesDuration(durationText)) {
+      controls.duration.click();
+      await sleep(300);
+      const option = Array.from(document.querySelectorAll('[role="menuitem"], [role="option"], li, button, .semi-dropdown-item'))
+        .find(el => visibleEnabled(el) && matchesDuration(el.innerText || el.textContent));
+      if (!option) {
+        const available = Array.from(document.querySelectorAll('[role="menuitem"], [role="option"], li, button, .semi-dropdown-item'))
+          .map(el => (el.innerText || el.textContent || '').trim())
+          .filter(t => /^(4|5|6|7|8|9|10|11|12|13|14|15|30)\s*s?$/i.test(t));
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true }));
+        lastCreateVideoCheck = { category: 'settings', reason: `requested duration ${targetDuration}s unavailable`, available };
+        workerLog('error', `[SETTINGS BLOCKED] Requested ${targetDuration}s is unavailable. Options: ${available.join(', ') || 'unknown'}.`);
+        return false;
+      }
+      option.click();
+      await sleep(300);
+      durationText = (controls.duration.innerText || controls.duration.textContent || '').trim();
+    }
+    if (!matchesDuration(durationText)) {
+      lastCreateVideoCheck = { category: 'settings', reason: `duration mismatch; requested ${targetDuration}s`, actual: durationText };
+      workerLog('error', `[SETTINGS BLOCKED] Requested ${targetDuration}s but selected control reads "${durationText}".`);
+      return false;
+    }
+
+    const targetRatio = currentTask?.aspectRatio || '16:9';
+    let ratioText = (controls.ratio.innerText || controls.ratio.textContent || '').trim();
+    if (!ratioText.includes(targetRatio)) {
+      controls.ratio.click();
+      await sleep(300);
+      const ratioOption = Array.from(document.querySelectorAll('[role="menuitem"], [role="option"], li, button, .semi-dropdown-item'))
+        .find(el => visibleEnabled(el) && (el.innerText || el.textContent || '').trim().includes(targetRatio));
+      if (!ratioOption) {
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true }));
+        lastCreateVideoCheck = { category: 'settings', reason: `requested ratio ${targetRatio} unavailable` };
+        workerLog('error', `[SETTINGS BLOCKED] Requested aspect ratio ${targetRatio} is unavailable.`);
+        return false;
+      }
+      ratioOption.click();
+      await sleep(300);
+      ratioText = (controls.ratio.innerText || controls.ratio.textContent || '').trim();
+    }
+    if (!ratioText.includes(targetRatio)) {
+      lastCreateVideoCheck = { category: 'settings', reason: `ratio mismatch; requested ${targetRatio}`, actual: ratioText };
+      workerLog('error', `[SETTINGS BLOCKED] Requested ${targetRatio} but selected control reads "${ratioText}".`);
+      return false;
+    }
+    lastCreateVideoCheck = { category: 'verified', duration: durationText, ratio: ratioText };
+    workerLog('success', `[SETTINGS VERIFIED] Duration=${durationText}; ratio=${ratioText}.`);
     return true;
   }
 
-  workerLog('error', '❌ [CREATE VIDEOS MODE] Video-specific duration and aspect-ratio controls were not both detected within 15 seconds. Prompt was not submitted.');
+  lastCreateVideoCheck = { category: 'mode', reason: 'video-specific duration and ratio controls not detected within 15 seconds' };
+  workerLog('error', '[MODE BLOCKED] Video-specific duration and aspect-ratio controls were not detected. Prompt was not submitted.');
   return false;
 }
 
@@ -1311,20 +1322,32 @@ async function sendChatReply(replyText) {
   return false;
 }
 
-async function submitViaDom(promptText, force = false) {
-  if (isSubmitting && !force) return false;
+async function submitViaDom(promptText) {
+  if (isSubmitting || workerSubmissionAttempted) {
+    workerLog('error', '[SUBMISSION BLOCKED] This task already has a submission attempt; refusing duplicate submission.');
+    return false;
+  }
   isSubmitting = true;
   try {
     const cleanPrompt = String(promptText || '').trim();
+    if (!cleanPrompt) {
+      moveWorkerState(WORKER_STATES.INTERNAL_FAILURE, { reason: 'empty prompt' });
+      throw new Error('Empty prompt; nothing was submitted.');
+    }
+    moveWorkerState(WORKER_STATES.VERIFY_MODE, { taskId: currentTask?.taskId || null });
     // In Create Videos Mode (zdola mode), send the pure video prompt directly — zero chat overhead!
     const fullPrompt = cleanPrompt;
 
     // Do not send prompts to ordinary chat if Create Videos mode is not verified.
     const videoModeReady = await ensureCreateVideoMode();
     if (!videoModeReady) {
-      throw new Error('Create Videos mode could not be verified; prompt was not submitted.');
+      const failedState = lastCreateVideoCheck.category === 'settings' ? WORKER_STATES.SETTINGS_FAILURE : WORKER_STATES.MODE_FAILURE;
+      moveWorkerState(failedState, lastCreateVideoCheck);
+      ipcRenderer.send('worker-error', { taskId: currentTask?.taskId, error: `${failedState}: ${lastCreateVideoCheck.reason || 'verification failed'}` });
+      throw new Error(`Create Videos gate failed: ${lastCreateVideoCheck.reason || 'mode/settings unverified'}`);
     }
     await syncDolaActionBarState(currentTask?.duration || 30);
+    moveWorkerState(WORKER_STATES.READY_TO_SUBMIT, { modeVerified: true, settings: lastCreateVideoCheck });
 
     // 2. Attach Reference Image if Image-to-Video task
     if (currentTask?.referenceImage && currentTask.referenceImage.dataBase64) {
@@ -1423,10 +1446,15 @@ async function submitViaDom(promptText, force = false) {
 
     // Submit exactly once through the trusted input handler. If verification fails,
     // stop instead of triggering DOM click and Enter fallbacks that can duplicate jobs.
+    workerSubmissionAttempted = true;
+    moveWorkerState(WORKER_STATES.SUBMITTING, { path: 'worker-trusted-submit', attempt: 1 });
     const res = await ipcRenderer.invoke('worker-trusted-submit', { fullPrompt });
-    if (!res || !res.success || !res.verified) {
-      throw new Error(res?.error || 'Dola prompt submission could not be verified.');
+    if (!res || !res.success || !res.verified || res.duplicate) {
+      moveWorkerState(WORKER_STATES.SUBMIT_UNKNOWN, { reason: res?.error || 'submission outcome not verified', duplicate: Boolean(res?.duplicate) });
+      ipcRenderer.send('worker-error', { taskId: currentTask?.taskId, error: `SUBMISSION_OUTCOME_UNKNOWN: ${res?.error || 'Prompt may have been sent; retry is blocked.'}` });
+      throw new Error(res?.error || 'Submission outcome unknown; refusing to retry.');
     }
+    moveWorkerState(WORKER_STATES.AWAITING_ACCEPTANCE, { submitActionVerified: true });
 
     // Automatically confirm 18+ age popup if present
     for (let i = 0; i < 4; i++) {
@@ -1453,7 +1481,7 @@ async function submitViaDom(promptText, force = false) {
       await sleep(300);
     }
 
-    workerLog('success', `🚀 [DOM SUBMIT] Clean video prompt submitted to Dola (Create Videos Mode)!`);
+    workerLog('info', '[SUBMISSION COMPLETE] One submit action dispatched; waiting for Dola acceptance evidence.');
   currentTaskStartTime = Date.now();
   isCooking = true;
   isPromptDispatched = true;
@@ -1598,10 +1626,9 @@ async function monitorGeneration() {
             return 'LIMIT_EXHAUSTED';
           }
           if (classified.isHighDemand) {
-            workerLog('warn', `⚠️ [HIGH DEMAND] Server capacity full. Auto-retrying in 5s...`);
-            await sleep(5000);
-            await submitViaDom(currentTask?.prompt || '');
-            return 'RETRY';
+            if (workerStateMachine.getState() === WORKER_STATES.AWAITING_ACCEPTANCE) moveWorkerState(WORKER_STATES.REJECTED, { source: 'dola_capacity_error', text: text.slice(0, 500) });
+            ipcRenderer.send('worker-error', { taskId: currentTask?.taskId, error: `DOLA_HIGH_DEMAND_NO_AUTO_RETRY: ${text}` });
+            return 'ERROR';
           }
           ipcRenderer.send('worker-error', {
             taskId: currentTask?.taskId,
@@ -1685,29 +1712,13 @@ async function monitorGeneration() {
       }
     } catch (_) {}
 
-    // Check DOM creation containers as acceptance indicator
+    // Silence, generic cards, and elapsed time are not acceptance evidence.
     if (!isGenerationAccepted && !isGlobalGenerationAccepted) {
-      const hasDolaCard = Array.from(document.querySelectorAll('div, span, p')).some(el => {
-        const t = (el.innerText || el.textContent || '').trim();
-        return (t.includes('Seedance 2.5') || t.includes('Queued on Dola') || t.includes('Generating') || t.includes('ETA:'));
-      });
-      const loadingCards = document.querySelector('div[class*="creation"], div[class*="generating"], div[class*="video-card"], div[class*="loading-card"]');
-      if (hasDolaCard || loadingCards) {
-        isGenerationAccepted = true;
-        isGlobalGenerationAccepted = true;
-        currentTaskStartTime = Date.now();
-        periodicTicker = Date.now();
-        workerLog('success', `⚡ [DOLA GENERATION CONFIRMED] Dola creation element found in DOM with NO ERRORS! Video generation in progress on GPU.`);
+      if (Date.now() - promptAcknowledgeStart > 7000) {
+        workerLog('warn', '[ACCEPTANCE PENDING] No generation-specific evidence yet; waiting without resubmitting.');
       }
+      continue;
     }
-
-    // 5. PROMPT SUBMISSION VERIFICATION & AUTOMATIC CONFIRMATION
-    if (!isGenerationAccepted && !isGlobalGenerationAccepted) {
-      const elapsedAwaiting = Date.now() - promptAcknowledgeStart;
-      // In first 7 seconds: watch for any immediate toast or error modal
-      if (elapsedAwaiting < 7000) {
-        continue;
-      }
       // After 7 seconds with zero errors: Dola prompt is confirmed accepted & rendering on GPU!
       isGenerationAccepted = true;
       isGlobalGenerationAccepted = true;
@@ -1736,6 +1747,10 @@ async function monitorGeneration() {
     }
   }
 
+  if (workerStateMachine.getState() === WORKER_STATES.AWAITING_ACCEPTANCE) {
+    moveWorkerState(WORKER_STATES.ACCEPTANCE_UNKNOWN, { reason: 'no acceptance evidence before monitor timeout', timeoutMs });
+    ipcRenderer.send('worker-error', { taskId: currentTask?.taskId, error: 'DOLA_ACCEPTANCE_UNKNOWN: No generation-specific acceptance evidence arrived before timeout. Automatic retry is blocked.' });
+  }
   return 'TIMEOUT';
 }
 
@@ -1772,6 +1787,9 @@ ipcRenderer.on('start-worker-task', async (event, taskData) => {
     isTaskRunning = true;
 
     currentTask = taskData;
+    workerStateMachine.reset();
+    workerSubmissionAttempted = false;
+    lastCreateVideoCheck = { category: 'mode', reason: 'not checked' };
     activeConversationId = null;
     currentTaskEta = null;
     currentTaskStartTime = Date.now();
