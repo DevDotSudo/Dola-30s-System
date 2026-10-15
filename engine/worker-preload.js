@@ -5,8 +5,85 @@
  */
 
 const { ipcRenderer } = require('electron');
-const { createWorkerStateMachine, STATES: WORKER_STATES } = require('./worker-state-machine');
-const { createResponseTracker, normalizeResponseText } = require('./dola-response-correlation');
+
+// Keep preload self-contained: Electron's sandboxed preload cannot resolve local
+// CommonJS modules via require('./...'). These helpers are mirrored by unit-tested
+// modules under engine/ for tests, but must be inlined for the live preload.
+const WORKER_STATES = Object.freeze({
+  INIT: 'INIT',
+  VERIFY_MODE: 'VERIFY_MODE',
+  VALIDATE_SETTINGS: 'VALIDATE_SETTINGS',
+  READY_TO_SUBMIT: 'READY_TO_SUBMIT',
+  SUBMITTING: 'SUBMITTING',
+  AWAITING_ACCEPTANCE: 'AWAITING_ACCEPTANCE',
+  ACCEPTED: 'ACCEPTED',
+  MODE_FAILURE: 'F_MODE',
+  SETTINGS_FAILURE: 'F_SETTINGS',
+  SUBMIT_FAILURE: 'F_SUBMIT',
+  SUBMIT_UNKNOWN: 'F_SUBMIT_UNKNOWN',
+  REJECTED: 'F_REJECTED',
+  NEEDS_CONFIRMATION: 'F_NEEDS_CONFIRMATION',
+  ACCEPTANCE_UNKNOWN: 'F_ACCEPTANCE_UNKNOWN',
+  INTERNAL_FAILURE: 'F_INTERNAL'
+});
+function createWorkerStateMachine() {
+  const terminal = new Set([
+    WORKER_STATES.ACCEPTED, WORKER_STATES.MODE_FAILURE, WORKER_STATES.SETTINGS_FAILURE,
+    WORKER_STATES.SUBMIT_FAILURE, WORKER_STATES.SUBMIT_UNKNOWN, WORKER_STATES.REJECTED,
+    WORKER_STATES.NEEDS_CONFIRMATION, WORKER_STATES.ACCEPTANCE_UNKNOWN,
+    WORKER_STATES.INTERNAL_FAILURE
+  ]);
+  const transitions = {
+    [WORKER_STATES.INIT]: [WORKER_STATES.VERIFY_MODE, WORKER_STATES.INTERNAL_FAILURE],
+    [WORKER_STATES.VERIFY_MODE]: [WORKER_STATES.VALIDATE_SETTINGS, WORKER_STATES.MODE_FAILURE, WORKER_STATES.INTERNAL_FAILURE],
+    [WORKER_STATES.VALIDATE_SETTINGS]: [WORKER_STATES.READY_TO_SUBMIT, WORKER_STATES.SETTINGS_FAILURE, WORKER_STATES.MODE_FAILURE, WORKER_STATES.INTERNAL_FAILURE],
+    [WORKER_STATES.READY_TO_SUBMIT]: [WORKER_STATES.VERIFY_MODE, WORKER_STATES.VALIDATE_SETTINGS, WORKER_STATES.SUBMITTING, WORKER_STATES.INTERNAL_FAILURE],
+    [WORKER_STATES.SUBMITTING]: [WORKER_STATES.AWAITING_ACCEPTANCE, WORKER_STATES.SUBMIT_FAILURE, WORKER_STATES.SUBMIT_UNKNOWN, WORKER_STATES.INTERNAL_FAILURE],
+    [WORKER_STATES.AWAITING_ACCEPTANCE]: [WORKER_STATES.ACCEPTED, WORKER_STATES.REJECTED, WORKER_STATES.NEEDS_CONFIRMATION, WORKER_STATES.ACCEPTANCE_UNKNOWN, WORKER_STATES.INTERNAL_FAILURE]
+  };
+  let state = WORKER_STATES.INIT;
+  const history = [];
+  return {
+    getState() { return state; },
+    isTerminal() { return terminal.has(state); },
+    getHistory() { return history.slice(); },
+    reset() { state = WORKER_STATES.INIT; history.length = 0; },
+    transition(next, evidence = {}) {
+      if (terminal.has(state)) throw new Error('Cannot transition from terminal state ' + state);
+      if (!(transitions[state] || []).includes(next)) throw new Error('Illegal worker transition: ' + state + ' -> ' + next);
+      const event = { from: state, to: next, at: new Date().toISOString(), evidence };
+      state = next;
+      history.push(event);
+      return event;
+    }
+  };
+}
+function normalizeResponseText(value) {
+  return String(value || '').replace(/\\s+/g, ' ').trim();
+}
+function createResponseTracker({ taskId, workerRunId, baselineTexts = [] }) {
+  const baseline = new Set(Array.from(baselineTexts, normalizeResponseText).filter(Boolean));
+  const seen = new Set();
+  return {
+    capture(candidate = {}) {
+      const text = normalizeResponseText(candidate.text);
+      if (!text || baseline.has(text) || seen.has(text)) return null;
+      seen.add(text);
+      return {
+        taskId: String(taskId || ''),
+        workerRunId: String(workerRunId || ''),
+        conversationId: candidate.conversationId || null,
+        messageId: candidate.messageId || null,
+        source: String(candidate.source || 'unknown'),
+        text: String(candidate.text),
+        receivedAt: candidate.receivedAt || new Date().toISOString(),
+        correlation: candidate.messageId ? 'message-identified' :
+          candidate.conversationId ? 'conversation-context-only' : 'new-observation-only',
+        isFinal: Boolean(candidate.isFinal)
+      };
+    }
+  };
+}
 const workerStateMachine = createWorkerStateMachine();
 let workerSubmissionAttempted = false;
 let lastCreateVideoCheck = { category: 'mode', reason: 'not checked' };
