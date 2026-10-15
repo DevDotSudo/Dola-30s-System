@@ -80,12 +80,14 @@ function workerLog(type, message) {
 
 function classifyDolaResponse(text) {
   if (!text || typeof text !== 'string') {
-    return { isError: false, isLimit: false, isGuestNotAllowed: false, isHighDemand: false, is15sFallback: false, isConfirmationRequest: false, isPolicyOrModeration: false, isGeneralFailure: false, isAcceptedNotice: false, reason: '' };
+    return { isError: false, isLimit: false, isGuestNotAllowed: false, isHighDemand: false, is15sFallback: false, isConfirmationRequest: false, isPolicyOrModeration: false, isGeneralFailure: false, isUnsupportedDuration: false, isAcceptedNotice: false, reason: '' };
   }
 
   // 1. Detect confirmation requests from Dola (e.g. "Confirm if you'd like me to proceed", "Reply 'Confirm'")
   const isConfirmationRequest = (
     /confirm\s+if\s+you['’]?d?\s+like\s+me\s+to\s+proceed/i.test(text) ||
+    /would\s+you\s+like\s+me\s+to\s+proceed/i.test(text) ||
+    /would\s+you\s+like\s+me\s+to\s+generate/i.test(text) ||
     /please\s+confirm\s+and\s+I\s+will\s+begin/i.test(text) ||
     /confirm\s+to\s+generate/i.test(text) ||
     /Reply\s*[“"'](?:Confirm|Yes|Start)[”"']/i.test(text) ||
@@ -98,14 +100,12 @@ function classifyDolaResponse(text) {
     /ready in/i.test(text) ||
     /I['’]ll (?:send it to you|let you know) when it['’]s done/i.test(text) ||
     /generate your \d+-second/i.test(text) ||
-    /currently supports durations from/i.test(text) ||
-    /15-second version/i.test(text) ||
-    /condensed to a 15-second/i.test(text) ||
     /Seedance/i.test(text) ||
     /Dreamina/i.test(text)
   );
 
-  const is15sFallback = false;
+  const isUnsupportedDuration = /(?:currently supports durations? from\s*4\s*to\s*15\s*seconds?|only supports?\s*(?:a\s*)?(?:maximum of\s*)?15\s*seconds?|nearest supported duration of\s*15\s*seconds?)/i.test(text);
+  const is15sFallback = isUnsupportedDuration;
 
   // If accepted, mentions like "You still have 0 video credits left today" are NOT an error for the current task!
   const isLimit = !isAcceptedNotice && (
@@ -138,15 +138,16 @@ function classifyDolaResponse(text) {
     /generation failed|failed to generate|something went wrong|unable to process|internal server error|server error/i.test(text)
   );
 
-  const isError = isLimit || isGuestNotAllowed || isHighDemand || isPolicyOrModeration || isGeneralFailure;
+  const isError = isUnsupportedDuration || isLimit || isGuestNotAllowed || isHighDemand || isPolicyOrModeration || isGeneralFailure;
   let reason = '';
-  if (isLimit) reason = 'DAILY_OR_PRO_LIMIT_REACHED';
+  if (isUnsupportedDuration) reason = 'DOLA_DURATION_UNSUPPORTED';
+  else if (isLimit) reason = 'DAILY_OR_PRO_LIMIT_REACHED';
   else if (isGuestNotAllowed) reason = 'GUEST_NOT_ALLOWED_LOGIN_REQUIRED';
   else if (isHighDemand) reason = 'GPU_HIGH_DEMAND';
   else if (isPolicyOrModeration) reason = 'CONTENT_POLICY_VIOLATION';
   else if (isGeneralFailure) reason = 'DOLA_GENERATION_FAILED';
 
-  return { isError, isLimit, isGuestNotAllowed, isHighDemand, is15sFallback, isConfirmationRequest, isPolicyOrModeration, isGeneralFailure, isAcceptedNotice, reason };
+  return { isError, isLimit, isGuestNotAllowed, isHighDemand, is15sFallback, isConfirmationRequest, isPolicyOrModeration, isGeneralFailure, isUnsupportedDuration, isAcceptedNotice, reason };
 }
 
 function classifyLimits(text) {
@@ -564,22 +565,35 @@ function processScrapedChatText(source, text) {
 
   // Detect Dola video generation acceptance notice
   const isVideoGenerationNotice = (
-    classified.isAcceptedNotice ||
-    clean.includes("Generated video:") ||
-    clean.includes("I’ll generate a") ||
-    clean.includes("I'll generate a") ||
-    clean.includes("The video will be generated") ||
-    clean.includes("Seedance") ||
-    clean.includes("Dreamina") ||
-    clean.includes("ready in") ||
-    clean.includes("I'll send it to you when it's done") ||
-    clean.includes("I’ll send it to you when it’s done")
+    !classified.isUnsupportedDuration &&
+    !classified.isConfirmationRequest &&
+    (
+      classified.isAcceptedNotice ||
+      clean.includes("Generated video:") ||
+      clean.includes("I’ll generate a") ||
+      clean.includes("I'll generate a") ||
+      clean.includes("The video will be generated") ||
+      clean.includes("ready in") ||
+      clean.includes("I'll send it to you when it's done") ||
+      clean.includes("I’ll send it to you when it’s done")
+    )
   );
 
   if (isVideoGenerationNotice && !isGlobalGenerationAccepted) {
     isGlobalGenerationAccepted = true;
     currentTaskStartTime = Date.now();
     workerLog('success', `🎬 [DOLA GENERATION CONFIRMED] ${clean}`);
+  }
+
+  // A duration-limit response is not a generation acceptance. Do not auto-confirm
+  // a shorter clip when the queued task explicitly requested 30 seconds.
+  if (classified.isUnsupportedDuration) {
+    workerLog('error', `❌ [DOLA DURATION UNSUPPORTED] Requested ${currentTask?.duration || 30}s, but Dola reports a 4–15s limit. No confirmation was sent; choose a supported duration or split the concept into multiple clips.`);
+    ipcRenderer.send('worker-error', {
+      taskId: currentTask?.taskId,
+      error: 'DOLA_DURATION_UNSUPPORTED: Dola currently reports a maximum supported duration of 15 seconds for this mode.'
+    });
+    return;
   }
 
   // Handle confirmation requests (e.g. "Confirm if you'd like me to proceed", "Reply 'Confirm'")
@@ -623,11 +637,10 @@ function processScrapedChatText(source, text) {
     return;
   }
 
-  // Clean reply with zero errors confirms generation started!
+  // Ordinary chat text is not proof that a video job started. Only a real
+  // creation ID/status from the intercepted generation response can confirm GPU work.
   if (!isGlobalGenerationAccepted && !classified.is15sFallback && !classified.isConfirmationRequest) {
-    isGlobalGenerationAccepted = true;
-    currentTaskStartTime = Date.now();
-    workerLog('success', `⚡ [DOLA GENERATION CONFIRMED] Dola AI confirmed prompt with NO ERRORS! Video generation underway on GPU.`);
+    workerLog('info', 'ℹ️ [DOLA RESPONSE] Received a chat response, but no generation job has been confirmed yet.');
   }
 }
 const seenFallbackApis = new Set();
