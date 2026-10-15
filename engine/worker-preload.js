@@ -6,6 +6,7 @@
 
 const { ipcRenderer } = require('electron');
 const { createWorkerStateMachine, STATES: WORKER_STATES } = require('./worker-state-machine');
+const { createResponseTracker, normalizeResponseText } = require('./dola-response-correlation');
 const workerStateMachine = createWorkerStateMachine();
 let workerSubmissionAttempted = false;
 let lastCreateVideoCheck = { category: 'mode', reason: 'not checked' };
@@ -16,7 +17,7 @@ let activeConversationId = null;
 let currentTaskEta = null;
 let streamedTextAccumulator = '';
 let baselineChatTexts = new Set();
-let reportedResponseKeys = new Set();
+let responseTracker = createResponseTracker({ taskId: '', workerRunId: '' });
 
 function parseDolaEta(text) {
   if (!text || typeof text !== 'string') return null;
@@ -71,7 +72,7 @@ let isSubmitting = false;
 const sleep = ms => new Promise(res => setTimeout(res, ms));
 
 function normalizeObservedText(value) {
-  return String(value || '').replace(/\\s+/g, ' ').trim();
+  return normalizeResponseText(value);
 }
 
 function snapshotExistingAssistantText() {
@@ -582,20 +583,19 @@ function processScrapedChatText(source, text) {
 
   loggedDolaReplies.add(clean);
 
-  // Emit Dola's exact response as structured task-scoped data, separately from logs.
-  const responseKey = String(currentTask?.workerRunId || '') + ':' + source + ':' + normalizedClean;
-  if (!reportedResponseKeys.has(responseKey)) {
-    reportedResponseKeys.add(responseKey);
+  // Emit only newly observed text, scoped to this task run and baseline snapshot.
+  const response = responseTracker.capture({
+    text: clean,
+    conversationId: activeConversationId || null,
+    source: source,
+    isFinal: source === 'api:stream_complete' || source === 'dom:observer'
+  });
+  if (response) {
     ipcRenderer.send('worker-dola-response', {
+      ...response,
       taskId: currentTask?.taskId,
       workerRunId: currentTask?.workerRunId,
-      conversationId: activeConversationId || null,
-      messageId: null,
-      source: source,
-      text: clean,
-      receivedAt: new Date().toISOString(),
-      correlation: activeConversationId ? 'conversation-identified' : 'new-observation-only',
-      isFinal: source === 'api:stream_complete' || source === 'dom:observer'
+      messageId: null
     });
   }
 
@@ -1848,8 +1848,12 @@ ipcRenderer.on('start-worker-task', async (event, taskData) => {
     currentTaskStartTime = Date.now();
     hasLoggedPayloadLock = false;
     loggedDolaReplies.clear();
-    reportedResponseKeys.clear();
     baselineChatTexts = snapshotExistingAssistantText();
+    responseTracker = createResponseTracker({
+      taskId: taskData.taskId,
+      workerRunId: taskData.workerRunId,
+      baselineTexts: Array.from(baselineChatTexts)
+    });
     isGlobalGenerationAccepted = false;
     isCooking = false;
     isPromptDispatched = false;
