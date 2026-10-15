@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const { normalizeResponseText, createResponseTracker } = require('./dola-response-correlation');
 
 test('normalizes response whitespace', () => {
-  assert.equal(normalizeResponseText('  Dola\\naccepted   the task '), 'Dola accepted the task');
+  assert.equal(normalizeResponseText('  Dola\naccepted   the task '), 'Dola accepted the task');
 });
 
 test('ignores text that was present before the task began', () => {
@@ -24,6 +24,6 @@ test('captures fresh text once and scopes it to the task run', () => {
 test('identifiers improve response correlation but do not imply acceptance', () => {
   const tracker = createResponseTracker({ taskId: 't3', workerRunId: 'r3' });
   const response = tracker.capture({ text: 'Please confirm', conversationId: 'c1', messageId: 'm1' });
-  assert.equal(response.correlation, 'identified');
+  assert.equal(response.correlation, 'message-identified');
   assert.equal(response.text, 'Please confirm');
 });

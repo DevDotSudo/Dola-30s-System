@@ -584,12 +584,14 @@ function processScrapedChatText(source, text) {
   loggedDolaReplies.add(clean);
 
   // Emit only newly observed text, scoped to this task run and baseline snapshot.
-  const response = responseTracker.capture({
-    text: clean,
-    conversationId: activeConversationId || null,
-    source: source,
-    isFinal: source === 'api:stream_complete' || source === 'dom:observer'
-  });
+  const response = (source === 'api:stream_complete' || source === 'dom:observer')
+    ? responseTracker.capture({
+        text: clean,
+        conversationId: activeConversationId || null,
+        source: source,
+        isFinal: source === 'api:stream_complete' || source === 'dom:observer'
+      })
+    : null;
   if (response) {
     ipcRenderer.send('worker-dola-response', {
       ...response,

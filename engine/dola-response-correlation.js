@@ -22,9 +22,11 @@ function createResponseTracker({ taskId, workerRunId, baselineTexts = [] }) {
       source: String(candidate.source || 'unknown'),
       text: String(candidate.text),
       receivedAt: candidate.receivedAt || new Date().toISOString(),
-      correlation: candidate.messageId || candidate.conversationId
-        ? 'identified'
-        : 'new-observation-only',
+      correlation: candidate.messageId
+        ? 'message-identified'
+        : candidate.conversationId
+          ? 'conversation-context-only'
+          : 'new-observation-only',
       isFinal: Boolean(candidate.isFinal)
     };
   }
