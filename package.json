@@ -6,7 +6,7 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron .",
-    "test": "node --test engine/worker-state-machine.test.js"
+    "test": "node --test engine/worker-state-machine.test.js engine/dola-response-correlation.test.js"
   },
   "keywords": [
     "dola",
