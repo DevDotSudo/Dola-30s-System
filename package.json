@@ -1,0 +1,23 @@
+{
+  "name": "sudodola-studio",
+  "version": "2.1.7",
+  "description": "SudoDola Studio v2.1.7 - Desktop Video Farm Orchestrator by SudoDotDev",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron .",
+    "test": "echo \"No test specified\" && exit 0"
+  },
+  "keywords": [
+    "dola",
+    "seedance",
+    "ai-video",
+    "desktop-app",
+    "sudodotdev"
+  ],
+  "author": "SudoDotDev",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^44.7.0"
+  }
+}

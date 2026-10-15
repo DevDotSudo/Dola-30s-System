@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SudoDola Studio Pro v2.5 — Seedance 2.5 • 30s</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-layout">
+    <!-- TOP HEADER -->
+    <header class="app-header">
+      <div class="header-left">
+        <div class="logo-mark">
+          <span class="logo-icon">⚡</span>
+        </div>
+        <div class="header-titles">
+          <div class="title-row">
+            <h1>SudoDola <span class="gradient-text">Studio Pro</span></h1>
+            <span class="badge-pro" style="background: linear-gradient(90deg, #ec4899, #8b5cf6);">🎬 CREATE VIDEOS MODE (30s)</span>
+            <span class="badge-skill">Seedance 2.5 • Zdola 30s Single Clip</span>
+          </div>
+          <p class="subtitle">Autonomous AI Video Generation Farm by SudoDotDev</p>
+        </div>
+      </div>
+
+      <div class="header-right">
+        <div class="output-folder-pill" id="btn-open-folder" title="Click to open video destination folder">
+          <span class="folder-icon">📂</span>
+          <span class="folder-path" id="folder-path-display">C:\Users\Davie\Videos\SudoDola</span>
+        </div>
+        <div class="account-pill" id="header-account-pill">
+          <span class="pulse-dot"></span>
+          <span class="account-name" id="focused-account-name">Scanning Accounts...</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- MAIN BODY -->
+    <div class="app-content">
+      <!-- LEFT WORKSPACE: CONTROLS & GENERATOR -->
+      <main class="workspace-main">
+        <!-- MODE SELECTOR TABS -->
+        <div class="mode-tabs">
+          <button class="mode-tab active" id="tab-btn-t2v" data-tab="t2v">
+            <span class="tab-icon">📝</span>
+            <span class="tab-title">Text to Video</span>
+            <span class="tab-badge">T2V</span>
+          </button>
+          <button class="mode-tab" id="tab-btn-i2v" data-tab="i2v">
+            <span class="tab-icon">🖼️</span>
+            <span class="tab-title">Image to Video</span>
+            <span class="tab-badge">I2V</span>
+          </button>
+          <button class="mode-tab" id="tab-btn-accounts" data-tab="accounts">
+            <span class="tab-icon">👥</span>
+            <span class="tab-title">Account Vault</span>
+            <span class="tab-count" id="badge-account-count">0</span>
+          </button>
+        </div>
+
+        <!-- TAB 1: TEXT TO VIDEO -->
+        <div class="tab-pane active" id="pane-t2v">
+          <div class="card glass-card">
+            <div class="card-header">
+              <div class="card-title-group">
+                <h3>Text-to-Video Generation</h3>
+                <span class="card-subtitle">Enter one or multiple prompts (one prompt per line)</span>
+              </div>
+              <div class="ratio-switch">
+                <button class="ratio-btn active" data-ratio="16:9">🖥️ 16:9 Landscape</button>
+                <button class="ratio-btn" data-ratio="9:16">📱 9:16 Portrait</button>
+              </div>
+            </div>
+
+            <div class="input-container">
+              <textarea id="t2v-prompts-input" placeholder="e.g. An ultra-realistic cinematic aerial drone shot gliding over a cyberpunk neon metropolis in the heavy rain, 8k resolution, photorealistic lighting, hyper-detailed..."></textarea>
+            </div>
+
+            <div class="composer-footer">
+              <div class="spec-pills">
+                <span class="spec-pill">🎯 Model: seedance-2-5</span>
+                <span class="spec-pill">⏱️ Clip Duration: 30s Strictly</span>
+                <span class="spec-pill">🎬 Mode: Create Videos (Zdola 30s)</span>
+              </div>
+              <div class="action-buttons">
+                <button class="btn btn-secondary" id="btn-t2v-clear">Clear</button>
+                <button class="btn btn-primary" id="btn-t2v-start">
+                  <span class="btn-icon">🚀</span>
+                  <span>Start 30s Video Creation</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- TAB 2: IMAGE TO VIDEO -->
+        <div class="tab-pane" id="pane-i2v">
+          <div class="card glass-card">
+            <div class="card-header">
+              <div class="card-title-group">
+                <h3>Image-to-Video Generation</h3>
+                <span class="card-subtitle">Attach reference starting frame image + motion prompt</span>
+              </div>
+              <div class="ratio-switch">
+                <button class="ratio-btn active" data-ratio="16:9">🖥️ 16:9 Landscape</button>
+                <button class="ratio-btn" data-ratio="9:16">📱 9:16 Portrait</button>
+              </div>
+            </div>
+
+            <div class="i2v-upload-zone" id="i2v-dropzone">
+              <div class="dropzone-content" id="dropzone-empty-state">
+                <span class="dropzone-icon">📸</span>
+                <p class="dropzone-title">Click or Drag & Drop Reference Image</p>
+                <p class="dropzone-hint">Supports PNG, JPG, JPEG, WEBP (Max 25MB)</p>
+              </div>
+              <div class="dropzone-preview hidden" id="dropzone-preview-state">
+                <img id="i2v-preview-img" src="" alt="Reference Preview">
+                <div class="preview-overlay">
+                  <span class="preview-filename" id="i2v-filename">image.png</span>
+                  <button class="btn btn-danger btn-sm" id="btn-remove-image">Remove</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="input-container mt-12">
+              <textarea id="i2v-prompt-input" rows="3" placeholder="Describe the camera motion and animation for the image (e.g. Dynamic camera zoom-in, volumetric smoke rolling across the ground, cinematic lighting transitions...)"></textarea>
+            </div>
+
+            <div class="composer-footer">
+              <div class="spec-pills">
+                <span class="spec-pill">🎯 Model: seedance-2-5</span>
+                <span class="spec-pill">⏱️ Clip Duration: 30s Strictly</span>
+                <span class="spec-pill">🖼️ Mode: Image-to-Video (Zdola 30s)</span>
+              </div>
+              <div class="action-buttons">
+                <button class="btn btn-primary" id="btn-i2v-start">
+                  <span class="btn-icon">🚀</span>
+                  <span>Start 30s I2V Video Creation</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- TAB 3: ACCOUNT VAULT -->
+        <div class="tab-pane" id="pane-accounts">
+          <div class="card glass-card">
+            <div class="card-header">
+              <div class="card-title-group">
+                <h3>Dola Account Vault</h3>
+                <span class="card-subtitle">Manage session cookies and check account health</span>
+              </div>
+              <div class="account-actions">
+                <button class="btn btn-primary btn-sm" id="btn-import-file">📁 Import Cookie File</button>
+                <button class="btn btn-secondary btn-sm" id="btn-import-cookies">📋 Paste JSON</button>
+                <button class="btn btn-secondary btn-sm" id="btn-login-dola">🔑 1-Click Login</button>
+              </div>
+            </div>
+
+            <div class="table-container">
+              <table class="accounts-table">
+                <thead>
+                  <tr>
+                    <th>Account Name</th>
+                    <th>Status</th>
+                    <th>Saved Videos</th>
+                    <th>Cooldown</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="accounts-table-body">
+                  <tr><td colspan="5" class="empty-cell">Loading accounts...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- LIVE GPU STATUS TICKER -->
+        <div class="status-card glass-card">
+          <div class="status-left">
+            <div class="status-spinner-container">
+              <div class="spinner-ring" id="status-spinner"></div>
+            </div>
+            <div class="status-text-group">
+              <span class="status-headline" id="status-headline">Ready for Video Generation</span>
+              <span class="status-subline" id="status-subline">Select a mode and click Start to begin</span>
+            </div>
+          </div>
+          <div class="status-metrics">
+            <div class="metric-box">
+              <span class="metric-label">Completed</span>
+              <span class="metric-val text-green" id="metric-saved">0</span>
+            </div>
+            <div class="metric-box">
+              <span class="metric-label">Queue</span>
+              <span class="metric-val text-purple" id="metric-queue">0</span>
+            </div>
+            <div class="metric-box">
+              <span class="metric-label">Failed</span>
+              <span class="metric-val text-red" id="metric-failed">0</span>
+            </div>
+            <button class="btn btn-danger btn-sm hidden" id="btn-queue-stop">Stop Queue</button>
+          </div>
+        </div>
+      </main>
+
+      <!-- RIGHT SIDEBAR: LIVE ACTIVITY & DOLA CHAT LOGS -->
+      <aside class="sidebar-logs">
+        <div class="card glass-card logs-card">
+          <div class="logs-header">
+            <div class="logs-title-row">
+              <h3>Live Activity & Dola Chat</h3>
+              <div class="log-filter-pills">
+                <button class="filter-pill active" data-filter="all">All</button>
+                <button class="filter-pill" data-filter="chat">💬 Dola Chat</button>
+                <button class="filter-pill" data-filter="error">Errors</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="logs-stream-container" id="logs-container">
+            <div class="log-entry log-info">
+              <span class="log-time">00:00:00</span>
+              <span class="log-badge info">INFO</span>
+              <span class="log-text">SudoDola Studio Pro v2.5 initialized. Ready.</span>
+            </div>
+          </div>
+
+          <div class="logs-footer">
+            <span class="logs-stats" id="logs-stats-text">Logs live streaming</span>
+            <button class="btn-clear-logs" id="btn-clear-logs">Clear</button>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>
