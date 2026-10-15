@@ -453,6 +453,9 @@ function handleCreationObject(cre) {
   if (!cre || typeof cre !== 'object') return;
   if (cre.status === 3 || cre.status_text === 'failed') {
     const errMsg = cre.error_msg || cre.status_text || 'Video creation failed on ByteDance GPU';
+    if (workerStateMachine.getState() === WORKER_STATES.AWAITING_ACCEPTANCE) {
+      moveWorkerState(WORKER_STATES.REJECTED, { source: 'creation_object', error: errMsg });
+    }
     workerLog('error', `❌ [DOLA GENERATION FAILED]: ${errMsg}`);
     const limitCheck = classifyDolaResponse(errMsg);
     if (limitCheck.isLimit) {
@@ -1513,6 +1516,15 @@ async function submitViaDom(promptText) {
     }
 
     return true;
+  } catch (err) {
+    const state = workerStateMachine.getState();
+    if (!workerStateMachine.isTerminal()) {
+      const target = state === WORKER_STATES.SUBMITTING
+        ? WORKER_STATES.SUBMIT_UNKNOWN
+        : WORKER_STATES.INTERNAL_FAILURE;
+      moveWorkerState(target, { error: err.message });
+    }
+    throw err;
   } finally {
     isSubmitting = false;
   }
